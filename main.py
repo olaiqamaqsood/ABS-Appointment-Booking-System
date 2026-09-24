@@ -203,10 +203,6 @@ def get_doctors():
         db.close()
 
 
-# ============================================================
-# REST API 1: Appointments by phone number
-# ============================================================
-
 @app.get("/appointments")
 def api_appointments_by_phone(phone_number: str):
     """
@@ -223,10 +219,6 @@ def api_appointments_by_phone(phone_number: str):
 
     return result
 
-
-# ============================================================
-# REST API 2: Single doctor by ID
-# ============================================================
 
 @app.get("/doctors/{doctor_id}")
 def api_doctor_by_id(doctor_id: int):
