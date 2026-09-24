@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
@@ -203,6 +203,57 @@ def get_doctors():
         db.close()
 
 
+# ============================================================
+# REST API 1: Appointments by phone number
+# ============================================================
+
+@app.get("/appointments")
+def api_appointments_by_phone(phone_number: str):
+    """
+    Return all appointments for a patient by phone number.
+    Each appointment includes complete doctor and patient details.
+    """
+    result = get_appointments(phone_number=phone_number)
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=404,
+            detail=result.get("message", "No appointments found."),
+        )
+
+    return result
+
+
+# ============================================================
+# REST API 2: Single doctor by ID
+# ============================================================
+
+@app.get("/doctors/{doctor_id}")
+def api_doctor_by_id(doctor_id: int):
+    """
+    Return a single doctor's details by ID.
+    """
+    db = SessionLocal()
+    try:
+        d = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+
+        if not d:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Doctor with ID {doctor_id} not found.",
+            )
+
+        return {
+            "id": d.id,
+            "name": d.name,
+            "speciality": d.speciality,
+            "start_time": str(d.start_time),
+            "end_time": str(d.end_time),
+        }
+    finally:
+        db.close()
+
+
 def find_doctor(doctor_name=None, speciality=None):
     db = SessionLocal()
     try:
@@ -233,7 +284,6 @@ def find_doctor(doctor_name=None, speciality=None):
             })
 
         if not results:
-            # Return available specialities so AI can suggest alternatives
             available = sorted({d.speciality for d in doctors})
             return {
                 "success": False,
