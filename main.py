@@ -246,6 +246,51 @@ def api_doctor_by_id(doctor_id: int):
         db.close()
 
 
+@app.get("/history/{session_id}")
+def api_session_history(session_id: str, limit: int = 10, include_tools: bool = False):
+    """
+    Return the last N conversation messages for a session.
+
+    Query params:
+      - limit (10): number of last messages to return
+      - include_tools (default false): include internal tool call messages
+
+    Returns the session state plus the last N messages.
+    """
+    db = SessionLocal()
+    try:
+        s = db.query(Session).filter(Session.session_id == session_id).first()
+
+        if not s:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session '{session_id}' not found.",
+            )
+
+        full_history = list(s.history or [])
+
+        if not include_tools:
+            visible = [m for m in full_history if m.get("role") in ("user", "assistant")]
+        else:
+            visible = full_history
+
+        if limit and limit > 0:
+            last_n = visible[-limit:]
+        else:
+            last_n = visible
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "total_messages": len(visible),
+            "returned": len(last_n),
+            "state": s.state,
+            "history": last_n,
+        }
+    finally:
+        db.close()
+
+
 def find_doctor(doctor_name=None, speciality=None):
     db = SessionLocal()
     try:
