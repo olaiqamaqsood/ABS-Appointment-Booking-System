@@ -250,7 +250,7 @@ def api_doctor_by_id(doctor_id: int):
 def api_session_history(session_id: str, limit: int = 10):
     """
     Return the last N conversation messages for a session.
-    Only user and assistant messages are returned.
+    Only user and assistant messages with actual text are returned.
     """
     db = SessionLocal()
     try:
@@ -267,6 +267,7 @@ def api_session_history(session_id: str, limit: int = 10):
         visible = [
             m for m in full_history
             if m.get("role") in ("user", "assistant")
+            and not m.get("tool_calls")
         ]
 
         if limit and limit > 0:
@@ -284,7 +285,6 @@ def api_session_history(session_id: str, limit: int = 10):
         }
     finally:
         db.close()
-
 
 def find_doctor(doctor_name=None, speciality=None):
     db = SessionLocal()
