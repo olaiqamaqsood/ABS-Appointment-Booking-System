@@ -49,6 +49,7 @@ class Appointment(Base):
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
     status = Column(String, default="booked")  # default value
+    google_event_id = Column(String, nullable=True, index=True) 
 
     # Relationships
     patient = relationship("Patient", back_populates="appointments")

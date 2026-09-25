@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from config import engine, Base, SessionLocal
 from models import Doctor, Patient, Appointment, Session
 from prompt import SYSTEM_PROMPT
+from google_calendar import create_event, update_event, delete_event
 
 
 load_dotenv()
@@ -268,6 +269,7 @@ def api_session_history(session_id: str, limit: int = 10):
             m for m in full_history
             if m.get("role") in ("user", "assistant")
             and not m.get("tool_calls")
+            
         ]
 
         if limit and limit > 0:
@@ -523,6 +525,27 @@ def book_appointment(patient_name, patient_phone, doctor_id,
         db.commit()
         db.refresh(a)
 
+        #  Google Calendar sync
+        try:
+            event_id = create_event(
+                patient_name=patient_result["name"],
+                patient_phone=patient_result["phone_number"],
+                doctor_name=d.name,
+                doctor_speciality=d.speciality,
+                appointment_date=req_date,
+                start_time=req_start,
+                end_time=req_end,
+                symptoms=a.symptoms,
+            )
+            if event_id:
+                a.google_event_id = event_id
+                db.commit()
+                db.refresh(a)
+        except Exception as e:
+            print(f"[book_appointment] Calendar sync failed: {e}")
+
+
+
         return {
             "success": True,
             "appointment_id": a.id,
@@ -619,6 +642,18 @@ def reschedule_appointment(appointment_id, new_date, new_start_time):
         db.commit()
         db.refresh(a)
 
+        # Google Calendar sync
+        if a.google_event_id:
+            try:
+                update_event(
+                    event_id=a.google_event_id,
+                    appointment_date=req_date,
+                    start_time=req_start,
+                    end_time=req_end,
+                )
+            except Exception as e:
+                print(f"[reschedule_appointment] Calendar sync failed: {e}")
+
         return {
             "success": True,
             "appointment_id": a.id,
@@ -659,6 +694,15 @@ def cancel_appointment(appointment_id, phone_number=None):
         d = db.query(Doctor).filter(Doctor.id == a.doctor_id).first()
 
         a.status = "cancelled"
+
+
+        # Google Calendar sync
+        if a.google_event_id:
+            try:
+                delete_event(a.google_event_id)
+            except Exception as e:
+                print(f"[cancel_appointment] Calendar sync failed: {e}")
+
         db.commit()
 
         return {
@@ -760,7 +804,7 @@ tools = [
             "description": (
                 "Check if a doctor's slot is free. "
                 "Date: YYYY-MM-DD. Time: HH:MM (00 or 30 minutes only). "
-                "Pass exclude_appointment_id during reschedule."
+                
             ),
             "parameters": {
                 "type": "object",
@@ -768,11 +812,11 @@ tools = [
                     "doctor_id": {"type": "integer"},
                     "appointment_date": {"type": "string"},
                     "start_time": {"type": "string"},
-                    "exclude_appointment_id": {"type": ["integer", "null"]},
+                    
                 },
                 "required": [
                     "doctor_id", "appointment_date", "start_time",
-                    "exclude_appointment_id",
+                    
                 ],
             },
         },
