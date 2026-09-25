@@ -247,15 +247,10 @@ def api_doctor_by_id(doctor_id: int):
 
 
 @app.get("/history/{session_id}")
-def api_session_history(session_id: str, limit: int = 10, include_tools: bool = False):
+def api_session_history(session_id: str, limit: int = 10):
     """
     Return the last N conversation messages for a session.
-
-    Query params:
-      - limit (10): number of last messages to return
-      - include_tools (default false): include internal tool call messages
-
-    Returns the session state plus the last N messages.
+    Only user and assistant messages are returned.
     """
     db = SessionLocal()
     try:
@@ -269,10 +264,10 @@ def api_session_history(session_id: str, limit: int = 10, include_tools: bool = 
 
         full_history = list(s.history or [])
 
-        if not include_tools:
-            visible = [m for m in full_history if m.get("role") in ("user", "assistant")]
-        else:
-            visible = full_history
+        visible = [
+            m for m in full_history
+            if m.get("role") in ("user", "assistant")
+        ]
 
         if limit and limit > 0:
             last_n = visible[-limit:]
