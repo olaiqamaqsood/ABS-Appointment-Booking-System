@@ -121,11 +121,39 @@ def load_session(session_id):
             db.add(s)
             db.commit()
             db.refresh(s)
+
         state = dict(s.state or {})
         history = list(s.history or [])
+
         for k, v in DEFAULT_STATE.items():
             if k not in state:
                 state[k] = v
+
+        # Refresh appointment info from DB
+        aid = state.get("appointment_id")
+        if aid:
+            a = db.query(Appointment).filter(Appointment.id == aid).first()
+            if a is None or a.status != "booked":
+                # Appointment cancelled ya deleted - clear state
+                state["appointment_id"] = None
+                state["appointment_date"] = None
+                state["start_time"] = None
+                state["end_time"] = None
+                state["symptoms"] = None
+            else:
+                # Fresh values DB se lo
+                state["appointment_date"] = a.appointment_date.strftime("%Y-%m-%d")
+                state["start_time"] = a.start_time.strftime("%H:%M")
+                state["end_time"] = a.end_time.strftime("%H:%M")
+                state["symptoms"] = a.symptoms
+                state["doctor_id"] = a.doctor_id
+
+                # Doctor details bhi refresh karo
+                doc = db.query(Doctor).filter(Doctor.id == a.doctor_id).first()
+                if doc:
+                    state["doctor_name"] = doc.name
+                    state["doctor_speciality"] = doc.speciality
+
         return state, history
     finally:
         db.close()
