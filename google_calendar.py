@@ -176,3 +176,31 @@ def delete_event(event_id):
     except Exception as e:
         print(f"[google_calendar] delete_event failed: {e}")
         return False
+
+
+def list_events(time_min=None, time_max=None, max_results=2500):
+    """
+    List events from the calendar between time_min and time_max.
+    Returns a list of event dicts. On failure returns [].
+    """
+    try:
+        service = get_service()
+
+        params = {
+            "calendarId": CALENDAR_ID,
+            "singleEvents": True,
+            "orderBy": "startTime",
+            "maxResults": max_results,
+            "showDeleted": False,
+        }
+        if time_min:
+            params["timeMin"] = time_min.isoformat()
+        if time_max:
+            params["timeMax"] = time_max.isoformat()
+
+        result = service.events().list(**params).execute()
+        return result.get("items", [])
+
+    except Exception as e:
+        print(f"[google_calendar] list_events failed: {e}")
+        return []

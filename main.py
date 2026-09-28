@@ -7,23 +7,79 @@ import re
 from datetime import time, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
+import asyncio
 
 from config import engine, Base, SessionLocal
 from models import Doctor, Patient, Appointment, Session
 from prompt import SYSTEM_PROMPT
-from google_calendar import create_event, update_event, delete_event
+from google_calendar import (
+    create_event, update_event, delete_event, list_events
+)
 
 
 load_dotenv()
 
-app = FastAPI(title="Appointment Booking System")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o")
 PAKISTAN_TZ = ZoneInfo("Asia/Karachi")
 SLOT_MINUTES = 30
+SYNC_INTERVAL_SECONDS = 60
 
 Base.metadata.create_all(bind=engine)
 
+
+# Background auto-sync
+
+async def auto_sync_loop():
+    """
+    Background task: pull changes from Google Calendar into DB
+    every SYNC_INTERVAL_SECONDS. Detects deletes and reschedules
+    made directly in Google Calendar.
+    """
+    # Small startup delay so app finishes booting first
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            result = await asyncio.to_thread(sync_from_calendar)
+            if result.get("success"):
+                u = result.get("updates", {})
+                res = u.get("rescheduled", [])
+                can = u.get("cancelled", [])
+                if res or can:
+                    print(
+                        f"[auto_sync] rescheduled={len(res)} "
+                        f"cancelled={len(can)}"
+                    )
+            else:
+                print(f"[auto_sync] failed: {result.get('message')}")
+        except Exception as e:
+            print(f"[auto_sync] error: {e}")
+
+        await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(auto_sync_loop())
+    print("[lifespan] background auto-sync started")
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    print("[lifespan] background auto-sync stopped")
+
+
+app = FastAPI(
+    title="Appointment Booking System",
+    lifespan=lifespan,
+)
+
+
+# ---------- Pydantic models ----------
 
 class ChatRequest(BaseModel):
     message: str
@@ -52,6 +108,7 @@ DEFAULT_STATE = {
     "end_time": None,
     "symptoms": None,
 }
+
 
 
 
@@ -87,6 +144,7 @@ def save_session(session_id, state, history):
         db.commit()
     finally:
         db.close()
+
 
 
 
@@ -158,6 +216,7 @@ def build_context(state, now):
     }
 
 
+# Doctor endpoints
 
 @app.post("/doctors")
 def create_doctor(doctor: DoctorProfile):
@@ -204,38 +263,16 @@ def get_doctors():
         db.close()
 
 
-@app.get("/appointments")
-def api_appointments_by_phone(phone_number: str):
-    """
-    Return all appointments for a patient by phone number.
-    Each appointment includes complete doctor and patient details.
-    """
-    result = get_appointments(phone_number=phone_number)
-
-    if not result.get("success"):
-        raise HTTPException(
-            status_code=404,
-            detail=result.get("message", "No appointments found."),
-        )
-
-    return result
-
-
 @app.get("/doctors/{doctor_id}")
 def api_doctor_by_id(doctor_id: int):
-    """
-    Return a single doctor's details by ID.
-    """
     db = SessionLocal()
     try:
         d = db.query(Doctor).filter(Doctor.id == doctor_id).first()
-
         if not d:
             raise HTTPException(
                 status_code=404,
                 detail=f"Doctor with ID {doctor_id} not found.",
             )
-
         return {
             "id": d.id,
             "name": d.name,
@@ -247,16 +284,24 @@ def api_doctor_by_id(doctor_id: int):
         db.close()
 
 
+# Appointment endpoints 
+
+@app.get("/appointments")
+def api_appointments_by_phone(phone_number: str):
+    result = get_appointments(phone_number=phone_number)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=404,
+            detail=result.get("message", "No appointments found."),
+        )
+    return result
+
+
 @app.get("/history/{session_id}")
 def api_session_history(session_id: str, limit: int = 10):
-    """
-    Return the last N conversation messages for a session.
-    Only user and assistant messages with actual text are returned.
-    """
     db = SessionLocal()
     try:
         s = db.query(Session).filter(Session.session_id == session_id).first()
-
         if not s:
             raise HTTPException(
                 status_code=404,
@@ -264,18 +309,13 @@ def api_session_history(session_id: str, limit: int = 10):
             )
 
         full_history = list(s.history or [])
-
         visible = [
             m for m in full_history
             if m.get("role") in ("user", "assistant")
             and not m.get("tool_calls")
-            
         ]
 
-        if limit and limit > 0:
-            last_n = visible[-limit:]
-        else:
-            last_n = visible
+        last_n = visible[-limit:] if limit and limit > 0 else visible
 
         return {
             "success": True,
@@ -287,6 +327,22 @@ def api_session_history(session_id: str, limit: int = 10):
         }
     finally:
         db.close()
+
+
+@app.post("/sync-from-calendar")
+def api_sync_from_calendar():
+    """
+    Manually trigger a sync from Google Calendar back to the DB.
+    Useful for admin dashboards / debugging. (Auto-sync already runs
+    in the background every SYNC_INTERVAL_SECONDS.)
+    """
+    result = sync_from_calendar()
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("message"))
+    return result
+
+
+# ---------- Doctor / patient / appointment logic ----------
 
 def find_doctor(doctor_name=None, speciality=None):
     db = SessionLocal()
@@ -437,7 +493,6 @@ def check_availability(doctor_id, appointment_date, start_time,
 
 def book_appointment(patient_name, patient_phone, doctor_id,
                      appointment_date, start_time, symptoms=None):
-    # 1. Patient info
     patient_result = create_or_get_patient(patient_name, patient_phone)
     if not patient_result.get("success"):
         return patient_result
@@ -477,7 +532,6 @@ def book_appointment(patient_name, patient_phone, doctor_id,
             return {"success": False,
                     "message": "Outside doctor's working hours."}
 
-        # 2. Doctor double-booking check
         doctor_conflict = db.query(Appointment).filter(
             Appointment.doctor_id == doctor_id,
             Appointment.appointment_date == req_date,
@@ -488,7 +542,6 @@ def book_appointment(patient_name, patient_phone, doctor_id,
         if doctor_conflict:
             return {"success": False, "message": "Slot already booked."}
 
-        # 3. Patient double-booking check (same patient at same time)
         patient_conflict = db.query(Appointment).filter(
             Appointment.patient_id == patient_id,
             Appointment.appointment_date == req_date,
@@ -511,7 +564,6 @@ def book_appointment(patient_name, patient_phone, doctor_id,
                 ),
             }
 
-        # 4. Create appointment
         a = Appointment(
             patient_id=patient_id,
             doctor_id=d.id,
@@ -525,7 +577,7 @@ def book_appointment(patient_name, patient_phone, doctor_id,
         db.commit()
         db.refresh(a)
 
-        #  Google Calendar sync
+        # Google Calendar sync
         try:
             event_id = create_event(
                 patient_name=patient_result["name"],
@@ -543,8 +595,6 @@ def book_appointment(patient_name, patient_phone, doctor_id,
                 db.refresh(a)
         except Exception as e:
             print(f"[book_appointment] Calendar sync failed: {e}")
-
-
 
         return {
             "success": True,
@@ -605,7 +655,6 @@ def reschedule_appointment(appointment_id, new_date, new_start_time):
         if req_start < d.start_time or req_end > d.end_time:
             return {"success": False, "message": "Outside doctor's working hours."}
 
-        # Doctor conflict (excluding this appointment)
         doctor_conflict = db.query(Appointment).filter(
             Appointment.doctor_id == d.id,
             Appointment.appointment_date == req_date,
@@ -617,7 +666,6 @@ def reschedule_appointment(appointment_id, new_date, new_start_time):
         if doctor_conflict:
             return {"success": False, "message": "New slot already booked."}
 
-        # Patient conflict (excluding this appointment)
         patient_conflict = db.query(Appointment).filter(
             Appointment.patient_id == a.patient_id,
             Appointment.appointment_date == req_date,
@@ -642,7 +690,6 @@ def reschedule_appointment(appointment_id, new_date, new_start_time):
         db.commit()
         db.refresh(a)
 
-        # Google Calendar sync
         if a.google_event_id:
             try:
                 update_event(
@@ -695,8 +742,6 @@ def cancel_appointment(appointment_id, phone_number=None):
 
         a.status = "cancelled"
 
-
-        # Google Calendar sync
         if a.google_event_id:
             try:
                 delete_event(a.google_event_id)
@@ -776,6 +821,99 @@ def get_appointments(phone_number=None):
         db.close()
 
 
+# Calendar -> DB sync
+
+def sync_from_calendar(days_before=30, days_after=180):
+    """
+    Fetch events from Google Calendar and sync changes back to DB.
+    - Date/time changed in calendar  -> update appointment
+    - Event deleted in calendar      -> mark appointment 'cancelled'
+    """
+    now = now_pk()
+    time_min = now - timedelta(days=days_before)
+    time_max = now + timedelta(days=days_after)
+
+    events = list_events(time_min=time_min, time_max=time_max)
+    calendar_map = {e["id"]: e for e in events if e.get("id")}
+
+    db = SessionLocal()
+    updates = {"rescheduled": [], "cancelled": [], "errors": []}
+
+    try:
+        appts = db.query(Appointment).filter(
+            Appointment.google_event_id.isnot(None),
+            Appointment.status == "booked",
+            Appointment.appointment_date >= time_min.date(),
+            Appointment.appointment_date <= time_max.date(),
+        ).all()
+
+        for a in appts:
+            event = calendar_map.get(a.google_event_id)
+
+            # Event deleted in calendar
+            if event is None:
+                a.status = "cancelled"
+                updates["cancelled"].append(a.id)
+                continue
+
+            start_info = event.get("start", {})
+            end_info = event.get("end", {})
+            start_str = start_info.get("dateTime")
+            end_str = end_info.get("dateTime")
+            if not start_str or not end_str:
+                continue
+
+            try:
+                start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            except ValueError:
+                updates["errors"].append({
+                    "appointment_id": a.id,
+                    "reason": "unparseable datetime",
+                })
+                continue
+
+            start_local = start_dt.astimezone(PAKISTAN_TZ)
+            end_local = end_dt.astimezone(PAKISTAN_TZ)
+
+            new_date = start_local.date()
+            new_start = start_local.time().replace(tzinfo=None, second=0, microsecond=0)
+            new_end = end_local.time().replace(tzinfo=None, second=0, microsecond=0)
+
+            if (a.appointment_date != new_date
+                    or a.start_time != new_start
+                    or a.end_time != new_end):
+                old_snapshot = (
+                    f"{a.appointment_date} "
+                    f"{a.start_time.strftime('%H:%M')}"
+                )
+                a.appointment_date = new_date
+                a.start_time = new_start
+                a.end_time = new_end
+                updates["rescheduled"].append({
+                    "appointment_id": a.id,
+                    "old": old_snapshot,
+                    "new": f"{new_date} {new_start.strftime('%H:%M')}",
+                })
+
+        db.commit()
+
+        return {
+            "success": True,
+            "scanned_events": len(events),
+            "scanned_appointments": len(appts),
+            "updates": updates,
+        }
+
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "message": f"Sync failed: {e}"}
+    finally:
+        db.close()
+
+
+# ---------- AI tools ----------
+
 tools = [
     {
         "type": "function",
@@ -803,8 +941,7 @@ tools = [
             "name": "check_availability",
             "description": (
                 "Check if a doctor's slot is free. "
-                "Date: YYYY-MM-DD. Time: HH:MM (00 or 30 minutes only). "
-                
+                "Date: YYYY-MM-DD. Time: HH:MM (00 or 30 minutes only)."
             ),
             "parameters": {
                 "type": "object",
@@ -812,12 +949,8 @@ tools = [
                     "doctor_id": {"type": "integer"},
                     "appointment_date": {"type": "string"},
                     "start_time": {"type": "string"},
-                    
                 },
-                "required": [
-                    "doctor_id", "appointment_date", "start_time",
-                    
-                ],
+                "required": ["doctor_id", "appointment_date", "start_time"],
             },
         },
     },
@@ -941,6 +1074,8 @@ def execute_tool(tool_name, args, state):
     return {"success": False, "message": f"Unknown tool: {tool_name}"}
 
 
+# ---------- Chat endpoint ----------
+
 @app.post("/chat")
 def chat(request: ChatRequest):
     session_id = request.session_id
@@ -951,10 +1086,8 @@ def chat(request: ChatRequest):
         return {"response": "Please provide a message.", "session_id": session_id}
 
     now = now_pk()
-
     history.append({"role": "user", "content": user_message})
 
-    # Build system + state + history
     ctx = build_context(state, now)
     system_message = (
         SYSTEM_PROMPT
@@ -965,7 +1098,6 @@ def chat(request: ChatRequest):
     messages = [{"role": "system", "content": system_message}]
     messages.extend(history)
 
-    # First AI call
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -981,7 +1113,6 @@ def chat(request: ChatRequest):
         save_session(session_id, state, history)
         return {"response": err, "session_id": session_id, "error": str(e)}
 
-    # Tool loop
     safety = 0
     while response.choices[0].message.tool_calls and safety < 8:
         safety += 1
@@ -1015,7 +1146,6 @@ def chat(request: ChatRequest):
             except Exception as e:
                 result = {"success": False, "message": f"Tool error: {e}"}
 
-            # Update state from tool results
             if tool_name == "find_doctor" and result.get("success"):
                 docs = result.get("doctors", [])
                 if len(docs) == 1:
@@ -1075,7 +1205,6 @@ def chat(request: ChatRequest):
                 "content": json.dumps(result, default=str),
             })
 
-        # Rebuild messages with fresh state
         ctx = build_context(state, now)
         system_message = (
             SYSTEM_PROMPT
@@ -1100,13 +1229,11 @@ def chat(request: ChatRequest):
             save_session(session_id, state, history)
             return {"response": err, "session_id": session_id, "error": str(e)}
 
-    # Final response
     final_text = (response.choices[0].message.content or "").strip()
     if not final_text:
         final_text = "How can I help you?"
 
     history.append({"role": "assistant", "content": final_text})
-
     save_session(session_id, state, history)
 
     return {"response": final_text, "session_id": session_id}
